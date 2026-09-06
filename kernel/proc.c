@@ -315,6 +315,7 @@ fork(void)
   np->state = RUNNABLE;
   release(&np->lock);
 
+  np->trace_mask = p->trace_mask; // Fork 的时候子进程继承父进程的 trace_mask
   return pid;
 }
 
