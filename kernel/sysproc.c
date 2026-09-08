@@ -75,15 +75,43 @@ sys_sleep(void)
   return 0;
 }
 
-
-#ifdef LAB_PGTBL
 int
 sys_pgaccess(void)
 {
   // lab pgtbl: your code here.
+  struct proc *p = myproc();
+  uint64 va; // 第一个用户页面的虚拟地址
+  int pages; // 检查的用户页面数量
+  uint64 addr;  // 用户地址，写入最终结果
+
+  if (argaddr(0, &va) < 0)
+      return -1;
+  if (argint(1, &pages) < 0)
+      return -1;
+  if (argaddr(2, &addr) < 0)
+      return -1;
+
+  // 计数逻辑
+  uint64 mask = 0; // 掩码
+  for (int i = 0; i < pages; i++)
+  {
+      pte_t *pte = walk(p->pagetable, va, 0);
+      if (pte == 0)
+          return -1;
+      if ((*pte & PTE_V) && (*pte & PTE_A))
+      {
+          mask = mask | (1 << i);
+          *pte &= ~PTE_A ; // 清空 PTE_A 位
+      }
+      va += PGSIZE;
+  }
+  // 使用 copyout 将 kernel 的信息转回 user
+  // int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+  if (copyout(p->pagetable, addr, (char *)&mask, sizeof(mask))<0)
+      return -1;
   return 0;
 }
-#endif
+
 
 uint64
 sys_kill(void)
