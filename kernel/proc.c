@@ -120,12 +120,21 @@ found:
   p->pid = allocpid();
   p->state = USED;
 
+  
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     freeproc(p);
     release(&p->lock);
     return 0;
   }
+  // Allocate a usyscall page
+  if ((p->usyscall = (struct usyscall *)kalloc()) == 0)
+  {
+      freeproc(p);
+      release(&p->lock);
+      return 0;
+  }
+  p->usyscall->pid = p->pid;
 
   // An empty user page table.
   p->pagetable = proc_pagetable(p);
@@ -150,6 +159,11 @@ found:
 static void
 freeproc(struct proc *p)
 {
+  // freeproc 释放内存  
+  if (p->usyscall)
+      kfree((void *)p->usyscall);
+  p->usyscall = 0;
+  
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
@@ -196,6 +210,22 @@ proc_pagetable(struct proc *p)
     return 0;
   }
 
+  // mappages mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+  // 用户态能够访问  ->  PTE_U
+  // 能够读取        -> PTE_R
+  // 不能写          -> 不要 PTE_W
+  // 不能执行        -> 不要 PTE_X
+  if (mappages(pagetable, USYSCALL, PGSIZE, (uint64)(p->usyscall), PTE_R | PTE_U) < 0)
+  {
+      // 当分配失败的时候，要先释放之前的，同时不用释放当前分配的
+      // uvmunmap(pagetable, USYSCALL, 1, 0);
+      uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+      uvmunmap(pagetable, TRAPFRAME, 1, 0);
+      uvmfree(pagetable, 0);
+      return 0;
+  }
+
+
   return pagetable;
 }
 
@@ -206,6 +236,8 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
 {
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
   uvmunmap(pagetable, TRAPFRAME, 1, 0);
+  // 销毁对应的页表
+  uvmunmap(pagetable, USYSCALL, 1, 0);
   uvmfree(pagetable, sz);
 }
 
