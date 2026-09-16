@@ -67,7 +67,49 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
-  } else {
+  }
+  else if (r_scause()==15) // scause 存储 page fault 的类型
+  {
+      uint64 va = r_stval(); // stval 存储发生错误的虚拟地址
+      uint64 page_va = PGROUNDDOWN(va);
+      pte_t *pte = 0;
+
+      if (va < MAXVA)
+          pte = walk(p->pagetable, page_va, 0);
+      
+      if (pte == 0)
+          p->killed = 1;
+      else if ((*pte & PTE_V) == 0)
+          p->killed = 1;
+      else if ((*pte & PTE_U) == 0)
+          p->killed = 1;
+      else if ((*pte & PTE_COW) == 0)
+          p->killed = 1;
+      else
+      {
+          uint64 oldpa;
+          uint flags;
+          char *mem;
+
+          oldpa = PTE2PA(*pte);
+          flags = PTE_FLAGS(*pte);
+
+          mem = kalloc();
+          if (mem == 0)
+              p->killed = 1;
+          else
+          {
+              memmove(mem, (char *)oldpa, PGSIZE);
+
+              flags |= PTE_W;
+              flags &= ~PTE_COW;
+
+              *pte = PA2PTE((uint64)mem) | flags;
+              kfree((void *)oldpa);
+          }
+      }
+  }
+  else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
     p->killed = 1;

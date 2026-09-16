@@ -303,26 +303,35 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
-  for(i = 0; i < sz; i += PGSIZE){
+  for (i = 0; i < sz; i += PGSIZE)
+  {
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
+    // if((mem = kalloc()) == 0)
+    //   goto err;
+    // memmove(mem, (char*)pa, PGSIZE);
+
+    if (*pte & PTE_W)
+    {
+        *pte &= ~PTE_W; // Write 位清空
+        *pte |= PTE_COW;
+    }
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    
+
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
       goto err;
     }
+    krefinc(pa);  // 为引用+1
   }
+  sfence_vma();
   return 0;
 
- err:
+  err:
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
 }
@@ -347,12 +356,42 @@ int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
+  pte_t *pte;
+  char *mem;
+  uint flags;
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
+
+    if (va0 >= MAXVA)
+        return -1;
+    
+    pte = walk(pagetable, va0, 0);
+    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
+        return -1;
+
+    pa0 = PTE2PA(*pte);
+    if (*pte & PTE_COW)
+    {
+        mem = kalloc();
+        if (mem == 0)
+            return -1;
+        // 复制整页，保留本次写入范围之外的数据。
+        memmove(mem, (void *)pa0, PGSIZE);
+
+        flags = (PTE_FLAGS(*pte) | PTE_W) & ~PTE_COW;
+        *pte = PA2PTE((uint64)mem) | flags;
+
+        //  kfree() 负责引用计数减一。
+        kfree((void *)pa0);
+
+        // 后面的写入必须使用新物理页。
+        pa0 = (uint64)mem;
+    }
+
+    if ((*pte & PTE_W) == 0)
+        return -1;
+    
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
