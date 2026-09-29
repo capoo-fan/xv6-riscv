@@ -25,12 +25,28 @@ barrier_init(void)
 static void 
 barrier()
 {
-  // YOUR CODE HERE
-  //
-  // Block until all threads have called barrier() and
-  // then increment bstate.round.
-  //
-  
+    // YOUR CODE HERE
+    //
+    // Block until all threads have called barrier() and
+    // then increment bstate.round.
+    //  pthread_cond_wait(&cond, &mutex);  在 cond 上进入等待状态，释放 mutex 锁醒来后重新获取锁
+    //  pthread_cond_broadcast(&cond);  唤醒正在等候 cond 的线程
+    pthread_mutex_lock(&bstate.barrier_mutex);
+    int current_round = bstate.round;
+    bstate.nthread++;
+    if (bstate.nthread == nthread)
+    {
+        bstate.nthread = 0;
+        bstate.round++;
+        pthread_cond_broadcast(&bstate.barrier_cond);
+    }
+    else
+    {
+        // bstate.round 记录当前运行的 round 数，作为唤醒条件
+        while (current_round == bstate.round) 
+            pthread_cond_wait(&bstate.barrier_cond,&bstate.barrier_mutex);
+    }
+    pthread_mutex_unlock(&bstate.barrier_mutex);
 }
 
 static void *
