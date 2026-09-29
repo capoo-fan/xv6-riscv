@@ -17,6 +17,8 @@ struct entry *table[NBUCKET];
 int keys[NKEYS];
 int nthread = 1;
 
+pthread_mutex_t bucket_lock[NBUCKET]; // 保护表头指针的 Lock
+pthread_mutex_t e_lock; // 保护 e 的 Lock
 
 double
 now()
@@ -40,7 +42,7 @@ static
 void put(int key, int value)
 {
   int i = key % NBUCKET;
-
+  pthread_mutex_lock(&bucket_lock[i]);
   // is the key already present?
   struct entry *e = 0;
   for (e = table[i]; e != 0; e = e->next) {
@@ -48,13 +50,13 @@ void put(int key, int value)
       break;
   }
   if(e){
-    // update the existing key.
-    e->value = value;
+      // update the existing key.
+      e->value = value;
   } else {
-    // the new is new.
-    insert(key, value, &table[i], table[i]);
+      // the new is new.
+      insert(key, value, &table[i], table[i]);
   }
-
+  pthread_mutex_unlock(&bucket_lock[i]);
 }
 
 static struct entry*
@@ -105,6 +107,10 @@ main(int argc, char *argv[])
   void *value;
   double t1, t0;
 
+  for (int i = 0; i < NBUCKET; i++)
+      pthread_mutex_init(&bucket_lock[i], NULL);
+  
+  pthread_mutex_init(&e_lock, NULL);
 
   if (argc < 2) {
     fprintf(stderr, "Usage: %s nthreads\n", argv[0]);
