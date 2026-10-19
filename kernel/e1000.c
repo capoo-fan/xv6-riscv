@@ -16,10 +16,16 @@ static struct mbuf *tx_mbufs[TX_RING_SIZE];
 static struct rx_desc rx_ring[RX_RING_SIZE] __attribute__((aligned(16)));
 static struct mbuf *rx_mbufs[RX_RING_SIZE];
 
+// QEMU holds received frames for one second after RCTL is enabled.
+// Its RISC-V timebase is 10 MHz; leave a small margin before sending.
+#define RX_STARTUP_TICKS 11000000UL
+
 // remember where the e1000's registers live.
 static volatile uint32 *regs;
 
 struct spinlock e1000_lock;
+
+extern pagetable_t kernel_pagetable;
 
 // called by pci_init().
 // xregs is the memory address at which the
@@ -29,7 +35,7 @@ e1000_init(uint32 *xregs)
 {
   int i;
 
-  initlock(&e1000_lock, "e1000");
+  initlock(&e1000_lock, "e1000"); // 确保 E1000 不会被多个进程使用
 
   regs = xregs;
 
@@ -90,6 +96,16 @@ e1000_init(uint32 *xregs)
   regs[E1000_RDTR] = 0; // interrupt after every received packet (no timer)
   regs[E1000_RADV] = 0; // interrupt after every packet (no timer)
   regs[E1000_IMS] = (1 << 7); // RXDW -- Receiver Descriptor Write Back
+
+  // This xv6 does not enable the S-mode time CSR. Map just the read-only
+  // CLINT timer page instead; no other harts use this page table yet.
+  uint64 timer_page = PGROUNDDOWN(CLINT_MTIME);
+  kvmmap(kernel_pagetable, timer_page, timer_page, PGSIZE, PTE_R);
+  sfence_vma();
+  volatile uint64 *mtime = (volatile uint64 *)CLINT_MTIME;
+  uint64 ready = *mtime + RX_STARTUP_TICKS;
+  while(*mtime < ready)
+    ;
 }
 
 int
@@ -102,19 +118,79 @@ e1000_transmit(struct mbuf *m)
   // the TX descriptor ring so that the e1000 sends it. Stash
   // a pointer so that it can be freed after sending.
   //
-  
+  acquire(&e1000_lock);
+  uint32 index = regs[E1000_TDT];
+  struct tx_desc pack = tx_ring[index];
+  if (!(pack.status & E1000_TXD_STAT_DD))
+  {
+      release(&e1000_lock);
+      return -1; // 检查是否已满
+  }
+
+
+  if(tx_mbufs[index] != 0)
+      mbuffree(tx_mbufs[index]);
+
+  tx_mbufs[index] = m;
+  tx_ring[index].addr = (uint64)m->head;
+  tx_ring[index].length = m->len;
+  tx_ring[index].cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_RS;
+  tx_ring[index].status = 0;
+
+  // Publish the descriptor before notifying the NIC.
+  __sync_synchronize();
+  regs[E1000_TDT] = (index + 1) % TX_RING_SIZE;
+  release(&e1000_lock);
   return 0;
 }
 
 static void
 e1000_recv(void)
 {
-  //
-  // Your code here.
-  //
-  // Check for packets that have arrived from the e1000
-  // Create and deliver an mbuf for each packet (using net_rx()).
-  //
+    //
+    // Your code here.
+    //
+    // Check for packets that have arrived from the e1000
+    // Create and deliver an mbuf for each packet (using net_rx()).
+    //
+    while (1)
+    {
+        acquire(&e1000_lock);
+        uint32 index = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
+        struct rx_desc* pack = &rx_ring[index];
+        struct mbuf*    m  = rx_mbufs[index];
+        if (!(pack->status & E1000_RXD_STAT_DD))
+        {
+            release(&e1000_lock);
+            break;
+        }
+
+        // Observe the DMA-written length and errors after observing DD.
+        __sync_synchronize();
+        struct mbuf *new_m = mbufalloc(0);
+        if (new_m == 0) {
+            // Drop the packet and reuse its buffer without giving it to net_rx.
+            pack->status = 0;
+            __sync_synchronize();
+            regs[E1000_RDT] = index;
+            release(&e1000_lock);
+            continue;
+        }
+        m->len = pack->length;
+        int valid = (pack->status & E1000_RXD_STAT_EOP) && pack->errors == 0;
+        rx_mbufs[index] = new_m;
+        pack->addr = (uint64)new_m->head;
+        pack->status = 0;
+        __sync_synchronize();
+        regs[E1000_RDT] = index;
+        release(&e1000_lock);
+
+        // net_rx takes ownership and may call e1000_transmit for an ARP reply.
+        if (valid)
+            net_rx(m);
+        else
+            mbuffree(m);
+    }
 }
 
 void
