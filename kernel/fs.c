@@ -374,11 +374,15 @@ iunlockput(struct inode *ip)
 
 // Return the disk block address of the nth block in inode ip.
 // If there is no such block, bmap allocates one.
+
+// bmap 负责读取和写入文件，写入时会分配新的存储块保存文件内容，需要的时候还会分配间接存储
+// ip->inode   bn->block_number
 static uint
 bmap(struct inode *ip, uint bn)
 {
   uint addr, *a;
   struct buf *bp;
+  struct buf *indirect_bp;
 
   if(bn < NDIRECT){
     if((addr = ip->addrs[bn]) == 0)
@@ -399,6 +403,38 @@ bmap(struct inode *ip, uint bn)
     }
     brelse(bp);
     return addr;
+  }
+
+  bn -= NINDIRECT;
+
+  if (bn < DOUBLE_NINDIRECT)
+  {
+      if ((addr = ip->addrs[NDIRECT+1]) == 0)
+          ip->addrs[NDIRECT + 1] = addr = balloc(ip->dev);
+      
+      uint outer = bn / NINDIRECT; // 外层编号
+      uint inner = bn % NINDIRECT; // 内层编号
+
+      bp = bread(ip->dev, addr);
+      a = (uint *)bp->data;
+      if ((addr = a[outer]) == 0)
+      {
+          a[outer] = addr = balloc(ip->dev);
+          log_write(bp);
+          
+      }
+      brelse(bp);
+
+      // 第二次查找
+      indirect_bp = bread(ip->dev, addr);
+      a = (uint *)indirect_bp->data;
+      if ((addr = a[inner]) == 0)
+      {
+          a[inner] = addr = balloc(ip->dev);
+          log_write(indirect_bp);
+      }
+      brelse(indirect_bp);
+      return addr;
   }
 
   panic("bmap: out of range");
@@ -432,6 +468,29 @@ itrunc(struct inode *ip)
     ip->addrs[NDIRECT] = 0;
   }
 
+  if (ip->addrs[NDIRECT + 1])
+  {
+      bp = bread(ip->dev, ip->addrs[NDIRECT + 1]);
+      a = (uint *)bp->data;
+      for (j = 0; j < NINDIRECT; j++)
+      {
+          if (a[j])
+          {
+              struct buf *indirect_bp = bread(ip->dev, a[j]);
+              uint *b = (uint *)indirect_bp->data;
+              for (int k = 0; k < NINDIRECT; k++)
+              {
+                  if (b[k])
+                    bfree(ip->dev, b[k]);
+              }
+              brelse(indirect_bp);
+              bfree(ip->dev, a[j]);
+          }
+      }
+      brelse(bp);
+      bfree(ip->dev, ip->addrs[NDIRECT + 1]);
+      ip->addrs[NDIRECT + 1] = 0;
+  }
   ip->size = 0;
   iupdate(ip);
 }
