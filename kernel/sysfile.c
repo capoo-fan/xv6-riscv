@@ -309,11 +309,32 @@ sys_open(void)
       return -1;
     }
     ilock(ip);
-    if(ip->type == T_DIR && omode != O_RDONLY){
+  }
+
+  // omode 打开文件的方式 O_NOFOLLOW 打开链接本身
+  for (int depth = 0; ip->type == T_SYMLINK && !(omode & O_NOFOLLOW); depth++)
+  {
+    n = ip->size;
+    // readi 将 ip 的目标路径读入 path 数组当中
+    if (depth >= 10 || n <= 0 || n > sizeof(path) ||
+        readi(ip, 0, (uint64)path, 0, n) != n || path[n-1] != '\0'){
       iunlockput(ip);
       end_op();
       return -1;
     }
+    iunlockput(ip);
+    if ((ip = namei(path)) == 0)  // namei 返回 path 对应的 inode
+    {
+      end_op();
+      return -1;
+    }
+    ilock(ip);
+  }
+
+  if(ip->type == T_DIR && omode != O_RDONLY){
+    iunlockput(ip);
+    end_op();
+    return -1;
   }
 
   if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
@@ -483,4 +504,32 @@ sys_pipe(void)
     return -1;
   }
   return 0;
+}
+
+uint64 sys_symlink(void)
+{
+    char target[MAXPATH];
+    char path[MAXPATH];
+
+    if (argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+        return -1;
+    begin_op();
+    struct inode *link_file = create(path, T_SYMLINK, 0, 0);
+    if (link_file == 0)
+    {
+        end_op();
+        return -1;
+    }
+    int len = strlen(target) + 1;
+
+    if (writei(link_file, 0, (uint64)target, 0, len) != len)
+    {
+        iunlockput(link_file);
+        end_op();
+        return -1;
+    }
+
+    iunlockput(link_file);
+    end_op();
+    return 0;
 }
