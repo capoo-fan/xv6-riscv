@@ -119,6 +119,7 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  memset(p->vmas, 0, sizeof(p->vmas));
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -267,6 +268,65 @@ growproc(int n)
   return 0;
 }
 
+// Copy resident mmap pages, leaving untouched pages lazily allocated.
+// The caller holds the child's lock; do not do file I/O here.
+static int
+mmapcopy(struct proc *p, struct proc *np)
+{
+  for (int i = 0; i < NVMA; i++)
+  {
+    struct vma *v = &p->vmas[i];
+    if(!v->valid)
+      continue;
+    uint64 end = v->addr + PGROUNDUP(v->length);
+    // va 从 v->addr 起始 每次处理一个 PGSIZE
+    for (uint64 va = v->addr; va < end; va += PGSIZE)
+    {
+      pte_t *pte = walk(p->pagetable, va, 0);
+      if(pte == 0 || (*pte & PTE_V) == 0)
+        continue;
+      char *mem = kalloc();
+      if(mem == 0)
+        goto bad;
+      memmove(mem, (char *)PTE2PA(*pte), PGSIZE);
+      // 在子进程中建立映射
+      if (mappages(np->pagetable, va, PGSIZE, (uint64)mem, PTE_FLAGS(*pte)) < 0) 
+      {
+        kfree(mem);
+        goto bad;
+      }
+    }
+  }
+
+  // Take file references only after all fallible allocations succeed.
+  for (int i = 0; i < NVMA; i++)
+  {
+    if (p->vmas[i].valid)
+    {
+      np->vmas[i] = p->vmas[i];
+      np->vmas[i].file = filedup(p->vmas[i].file);
+    }
+  }
+  return 0;
+
+bad:
+  // Discard partial copies without writing the child's pages to files.
+  for (int i = 0; i < NVMA; i++)
+  {
+    struct vma *v = &p->vmas[i];
+    if(!v->valid)
+      continue;
+    uint64 end = v->addr + PGROUNDUP(v->length);
+    for (uint64 va = v->addr; va < end; va += PGSIZE)
+    {
+      pte_t *pte = walk(np->pagetable, va, 0);
+      if(pte != 0 && (*pte & PTE_V))
+        uvmunmap(np->pagetable, va, 1, 1);
+    }
+  }
+  return -1;
+}
+
 // Create a new process, copying the parent.
 // Sets up child kernel stack to return as if from fork() system call.
 int
@@ -288,6 +348,12 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
+
+  if(mmapcopy(p, np) < 0){
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
@@ -343,6 +409,10 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+  // Write back and release mappings before acquiring process/wait locks.
+  if(mmapexit(p) < 0)
+    status = -1;
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){

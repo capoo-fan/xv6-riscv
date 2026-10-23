@@ -6,6 +6,7 @@
 
 #include "types.h"
 #include "riscv.h"
+#include "memlayout.h"
 #include "defs.h"
 #include "param.h"
 #include "stat.h"
@@ -483,4 +484,204 @@ sys_pipe(void)
     return -1;
   }
   return 0;
+}
+
+uint64 sys_mmap(void)
+{
+    int length, prot, flags, offset;
+    uint64 addr;
+    struct file *f;
+    struct proc *p = myproc();
+
+    if (argaddr(0,&addr)<0 || argint(1, &length) < 0 || argint(2, &prot) < 0 || argint(3, &flags) < 0 || argfd(4, 0,&f) < 0 || argint(5, &offset))
+        return -1;
+
+    if (addr != 0 || offset != 0 || length <= 0)
+        return -1;
+    if (flags != MAP_SHARED && flags != MAP_PRIVATE)
+        return -1;
+    if (prot == 0 || (prot & ~(PROT_READ | PROT_WRITE)))
+        return -1;
+
+    if (f->type != FD_INODE || !f->readable)
+        return -1;
+    if (flags == MAP_SHARED && (prot & PROT_WRITE) && !f->writable)
+        return -1;
+
+    struct vma *v = 0;
+    uint64 top = TRAPFRAME;
+
+    for (int i = 0; i < NVMA; i++)
+    {
+        if (p->vmas[i].valid)
+        {
+            // 找到所有现有映射中最低的起始地址。
+            if (p->vmas[i].addr < top)
+                top = p->vmas[i].addr;
+        }
+        else if (v == 0)
+        {
+            v = &p->vmas[i];
+        }
+    }
+
+    if (v == 0)
+        return -1;
+
+    uint64 span = PGROUNDUP((uint64)length);
+    if (span > top || top - span < PGROUNDUP(p->sz))
+        return -1;
+
+    uint64 start = top - span;
+
+    // 只登记元数据。
+    v->addr = start;
+    v->length = length;
+    v->prot = prot;
+    v->flags = flags;
+    v->offset = offset;
+    v->file = filedup(f);
+    v->valid = 1;
+
+    return start;
+}
+
+// Write back one resident page without changing the file's current offset.
+static int
+mmapwriteback(struct vma *v, uint64 va, uint64 pa)
+{
+  uint64 delta = va - v->addr;
+  uint64 offset = v->offset + delta;
+  uint n = PGSIZE;
+  if(v->length - delta < n)
+    n = v->length - delta;
+
+  // Use the same transaction limit as filewrite().
+  int max = ((MAXOPBLOCKS-1-1-2) / 2) * BSIZE;
+  for (uint done = 0; done < n;)
+  {
+    int n1 = n - done;
+    if(n1 > max)
+      n1 = max;
+
+    begin_op();
+    ilock(v->file->ip);
+    // Do not extend the file with the zero-filled bytes beyond EOF.
+    if (offset + done >= v->file->ip->size)
+    {
+      iunlock(v->file->ip);
+      end_op();
+      break;
+    }
+    if(n1 > v->file->ip->size - (offset + done))
+      n1 = v->file->ip->size - (offset + done);
+
+    int r = writei(v->file->ip, 0, pa + done, offset + done, n1);
+    iunlock(v->file->ip);
+    end_op();
+
+    if(r != n1)
+      return -1;
+    done += n1;
+  }
+  return 0;
+}
+
+// Unmap a validated VMA range. Exit must release resources even if an
+// individual writeback fails; munmap leaves the mapping intact on error.
+static int
+mmapunmap(struct proc *p, struct vma *v, uint64 addr, uint64 end, int exiting)
+{
+  int error = 0;
+  uint64 vend = v->addr + PGROUNDUP(v->length);
+
+  if (v->flags == MAP_SHARED && (v->prot & PROT_WRITE))
+  {
+    for (uint64 va = addr; va < end; va += PGSIZE)
+    {
+      pte_t *pte = walk(p->pagetable, va, 0);
+      if(pte == 0 || (*pte & PTE_V) == 0)
+        continue;
+      if (mmapwriteback(v, va, PTE2PA(*pte)) < 0)
+      {
+        error = -1;
+        if(!exiting)
+          return -1;
+      }
+    }
+  }
+
+  for (uint64 va = addr; va < end; va += PGSIZE)
+  {
+    pte_t *pte = walk(p->pagetable, va, 0);
+    if(pte != 0 && (*pte & PTE_V))
+      uvmunmap(p->pagetable, va, 1, 1);
+  }
+
+  if(addr == v->addr && end == vend){
+    fileclose(v->file);
+    memset(v, 0, sizeof(*v));
+  } else if(addr == v->addr){
+    uint64 removed = end - v->addr;
+    v->addr = end;
+    v->offset += removed;
+    v->length -= removed;
+  } else {
+    v->length = addr - v->addr;
+  }
+  return error;
+}
+
+int
+mmapexit(struct proc *p)
+{
+  int error = 0;
+  for (int i = 0; i < NVMA; i++)
+  {
+    struct vma *v = &p->vmas[i];
+    if(v->valid && mmapunmap(p, v, v->addr,
+                            v->addr + PGROUNDUP(v->length), 1) < 0)
+      error = -1;
+  }
+  return error;
+}
+
+uint64
+sys_munmap(void)
+{
+  int length;
+  uint64 addr;
+  struct proc *p = myproc();
+  if(argaddr(0, &addr) < 0 || argint(1, &length) < 0)
+    return -1;
+  if(length <= 0 || addr % PGSIZE != 0)
+    return -1;
+
+  uint64 size = PGROUNDUP((uint64)length); //将要映射的范围根据 pagesize 向上取整
+  if(addr >= TRAPFRAME || size > TRAPFRAME - addr)
+    return -1;
+  uint64 end = addr + size;
+
+  struct vma *v = 0;
+  uint64 vend = 0;
+  for (int i = 0; i < NVMA; i++)
+  {
+    struct vma *candidate = &p->vmas[i];
+    if(!candidate->valid)
+        continue;
+
+    uint64 candidate_end = candidate->addr + PGROUNDUP(candidate->length);
+
+    if (addr >= candidate->addr && end <= candidate_end)
+    {
+        v = candidate;
+        vend = candidate_end;
+        break;
+    }
+  }
+  // This lab does not require splitting a VMA around a hole.
+  if(v == 0 || (addr != v->addr && end != vend))
+    return -1;
+
+  return mmapunmap(p, v, addr, end, 0);
 }

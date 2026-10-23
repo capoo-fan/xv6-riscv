@@ -5,6 +5,10 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
+#include "fcntl.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -27,6 +31,66 @@ void
 trapinithart(void)
 {
   w_stvec((uint64)kernelvec);
+}
+
+// Load one file-backed page on its first user access.
+static int
+mmapfault(struct proc *p, uint64 addr, int write)
+{
+  if(addr >= TRAPFRAME)
+    return -1;
+
+  uint64 va = PGROUNDDOWN(addr);
+  struct vma *v = 0;
+  for (int i = 0; i < NVMA; i++)
+  {
+    struct vma *candidate = &p->vmas[i];
+    // The last page is mapped in full even for a non-page-sized length.
+    if (candidate->valid && va >= candidate->addr &&
+        va - candidate->addr < candidate->length)
+    {
+      v = candidate;
+      break;
+    }
+  }
+
+  if(v == 0 || (write && !(v->prot & PROT_WRITE)) ||
+     (!write && !(v->prot & PROT_READ)))
+    return -1;
+
+  // A present PTE means this is not a demand-allocation fault.
+  pte_t *pte = walk(p->pagetable, va, 0);
+  if(pte != 0 && (*pte & PTE_V))
+    return -1;
+
+  uint64 offset = v->offset + (va - v->addr);
+  if(offset != (uint)offset)
+    return -1;
+
+  char *mem = kalloc();
+  if(mem == 0)
+    return -1;
+  memset(mem, 0, PGSIZE);
+
+  ilock(v->file->ip);
+  int n = readi(v->file->ip, 0, (uint64)mem, offset, PGSIZE);
+  iunlock(v->file->ip);
+  if(n < 0){
+    kfree(mem);
+    return -1;
+  }
+
+  int perm = PTE_U;
+  if(v->prot & PROT_READ)
+      perm |= PTE_R;
+  
+  if(v->prot & PROT_WRITE)
+    perm |= PTE_R | PTE_W;
+  if(mappages(p->pagetable, va, PGSIZE, (uint64)mem, perm) < 0){
+    kfree(mem);
+    return -1;
+  }
+  return 0;
 }
 
 //
@@ -65,6 +129,14 @@ usertrap(void)
     intr_on();
 
     syscall();
+  } else if(r_scause() == 13 || r_scause() == 15){
+    // Save trap CSRs before enabling interrupts for file I/O.
+    uint64 addr = r_stval();  // 保存错误虚拟地址
+    int write = r_scause() == 15;
+    intr_on();
+    if(mmapfault(p, addr, write) < 0)
+      p->killed = 1;
+    // Keep epc unchanged so the faulting instruction runs again.
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {
